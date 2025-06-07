@@ -1,0 +1,2374 @@
+---
+title: "PrimerWord"
+author: "Ismael Salcedo Cornago"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: '3'
+    df_print: paged
+  word_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+---
+
+## Resultados del kriging espacial por grupo de edad
+
+En esta sección se presentan los resultados del kriging espacial aplicado a las tasas de mortalidad suavizadas por grupo de edad, según el procedimiento descrito previamente. Para cada grupo, se ha realizado un suavizado bayesiano empírico seguido de interpolación espacial mediante kriging universal ajustado sobre los centroides provinciales. La representación cartográfica resultante permite identificar regiones con exceso o defecto de riesgo respecto a la tendencia general. Además, se han generado diagramas de caja (boxplots) que complementan la visualización geográfica, facilitando la comparación de la distribución de las tasas suavizadas entre provincias.
+
+```{r warning=FALSE,message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(sp)
+library(sf)
+library(gstat)
+library(ggmap)
+```
+
+### Grupo [50,60)
+
+```{r warning=FALSE,message=FALSE}
+# Carga de datos y suavizado
+
+load("Carto_SpainPROV.Rdata")
+load("grupo_50_60.RData")
+load("grupo_60_70.RData")
+load("grupo_70_80.RData")
+load("grupo_80_100.RData")
+
+
+# Filtrar datos válidos
+datos50_60 <- grupo_50_60 %>%
+  filter(!is.na(O), !is.na(Pop), Pop > 0)
+
+# Calcular tasa cruda
+datos50_60 <- datos50_60 %>%
+  mutate(tasa_cruda = crude.rate)
+
+datos50_60 <- datos50_60 %>%
+  mutate(Region = ID)
+
+# Preparar centroides de provincias
+carto_esp <- Carto_Esp
+centroides <- coordinates(carto_esp)
+coord_df <- as.data.frame(centroides)
+colnames(coord_df) <- c("x", "y")
+coord_df$Region <- as.integer(as.character(carto_esp@data$ID))
+
+datos50_60 <- datos50_60 %>%
+  mutate(Region = as.integer(as.character(Region)))
+
+# Unir coordenadas
+datos50_60 <- left_join(datos50_60, coord_df, by = "Region")
+
+# Calcular media y varianza global
+media_global <- mean(datos50_60$tasa_cruda, na.rm = TRUE)
+var_global <- var(datos50_60$tasa_cruda, na.rm = TRUE)
+cat(" Media global:", round(media_global, 2), "\n")
+cat(" Varianza global:", round(var_global, 2), "\n")
+
+# Varianza local por región
+var_local <- datos50_60 %>%
+  group_by(Region) %>%
+  summarise(var_local = var(tasa_cruda, na.rm = TRUE), .groups = "drop")
+
+# Suavizado bayesiano empírico
+datos50_60 <- left_join(datos50_60, var_local, by = "Region") %>%
+  mutate(
+    coef_contraccion = var_global / (var_global + var_local),
+    tasa_suavizada = coef_contraccion * tasa_cruda + (1 - coef_contraccion) * media_global
+  )
+
+datos_long_5060 <- datos50_60 %>%
+  select(Region, tasa_cruda, tasa_suavizada) %>%
+  pivot_longer(cols = c(tasa_cruda, tasa_suavizada),
+               names_to = "tipo", values_to = "tasa")
+
+# Boxplot comparativo entre tasa cruda y tasa suavizada
+ggplot(datos_long_5060, aes(x = tipo, y = tasa, fill = tipo)) +
+  geom_boxplot(width = 0.5, alpha = 0.8, outlier.shape = 16, outlier.size = 2) + 
+  labs(
+    title = "Tasa por 100.000 habitantes",
+    x = "",
+    y = ""
+  ) +
+  scale_fill_manual(values = c("tasa_cruda" = "red", "tasa_suavizada" = "blue")) +
+  theme_minimal(base_size = 14) +  
+  theme(
+    legend.position = "none",  # Quita la leyenda
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"), 
+    axis.title = element_text(size = 14, face = "bold"), 
+    axis.text = element_text(size = 12),  
+    panel.grid.major = element_line(color = "gray", size = 0.1),  
+    panel.grid.minor = element_line(color = "gray", size = 0.1),  
+    panel.border = element_rect(color = "gray", fill = NA, size = 0.5)
+  )
+```
+```{r warning=FALSE,message=FALSE}
+
+# Agregar a nivel provincia (media de todos los años)
+datos_agg_5060 <- datos50_60 %>%
+  group_by(Region, x, y) %>%
+  summarise(tasa_suavizada = mean(tasa_suavizada, na.rm = TRUE), .groups = "drop")
+
+# Crear SpatialPointsDataFrame para ajuste
+coordinates(datos_agg_5060) <- ~x + y
+proj4string(datos_agg_5060) <- CRS("+proj=utm +zone=30 +datum=WGS84")
+
+# Añadir variables de tendencia
+datos_agg_5060$tendencia_x <- datos_agg_5060@coords[,1]
+datos_agg_5060$tendencia_y <- datos_agg_5060@coords[,2]
+
+# Ajuste de modelo lineal (tendencia cuadrática)
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+# Ajustar variograma de los residuos
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+plot(vgm_emp, vgm_fit_5060, main = "")
+
+# Kriging universal sobre los centroides
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+# Convertir a data.frame y unir con mapa
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Mapa final
+ggplot(carto_sf) +
+  geom_sf(aes(fill = var1.pred), color = "white") +
+  scale_fill_viridis_c(name = "Tasa estimada") +
+  labs(
+    title = "",
+    x = "X", y = "Y"
+  ) +
+  theme_minimal()
+
+```
+
+El boxplot para este grupo revela una distribución relativamente simétrica, con una amplitud moderada y presencia de valores atípicos por exceso. La dispersión indica heterogeneidad en las tasas suavizadas, con diferencias significativas entre provincias.
+
+El mapa interpolado refleja una distribución espacial sin un gradiente dominante, aunque con una ligera concentración del riesgo suavizado en el noroeste peninsular. Se identifican provincias con valores elevados como La Coruña, Lugo, Asturias y León. Por el contrario, en el sur y sureste del país —especialmente en Murcia, Almería, Alicante y Granada— se observan estimaciones notablemente inferiores. Esta heterogeneidad espacial sugiere la existencia de factores regionales específicos en edades precoces de la enfermedad, posiblemente relacionados con diferencias en el acceso a diagnóstico, en estilos de vida o en características sociodemográficas que influyen en la exposición acumulada a factores de riesgo.
+
+
+## Grupo [60,70)
+Para el segundo grupo de edad (60-70 años) se realiza el siguiente codigo:
+ 
+```{r warning=FALSE,message=FALSE}
+# Filtrar datos válidos
+datos60_70 <- grupo_60_70 %>%
+  filter(!is.na(O), !is.na(Pop), Pop > 0)
+
+datos60_70 <- datos60_70 %>%
+  mutate(tasa_cruda = crude.rate)
+
+datos60_70 <- datos60_70 %>%
+  mutate(Region = ID)
+
+# Preparar centroides de provincias
+carto_esp <- Carto_Esp
+centroides <- coordinates(carto_esp)
+coord_df <- as.data.frame(centroides)
+colnames(coord_df) <- c("x", "y")
+coord_df$Region <- as.integer(as.character(carto_esp@data$ID))
+
+datos60_70 <- datos60_70 %>%
+  mutate(Region = as.integer(as.character(Region)))
+
+# Unir coordenadas
+datos60_70 <- left_join(datos60_70, coord_df, by = "Region")
+
+# Calcular media y varianza global
+media_global <- mean(datos60_70$tasa_cruda, na.rm = TRUE)
+var_global <- var(datos60_70$tasa_cruda, na.rm = TRUE)
+cat(" Media global:", round(media_global, 2), "\n")
+cat(" Varianza global:", round(var_global, 2), "\n")
+
+# Varianza local por región
+var_local <- datos60_70 %>%
+  group_by(Region) %>%
+  summarise(var_local = var(tasa_cruda, na.rm = TRUE), .groups = "drop")
+
+# Suavizado bayesiano empírico
+datos60_70 <- left_join(datos60_70, var_local, by = "Region") %>%
+  mutate(
+    coef_contraccion = var_global / (var_global + var_local),
+    tasa_suavizada = coef_contraccion * tasa_cruda + (1 - coef_contraccion) * media_global
+  )
+
+
+datos_long_6070 <- datos60_70 %>%
+  select(Region, tasa_cruda, tasa_suavizada) %>%
+  pivot_longer(cols = c(tasa_cruda, tasa_suavizada),
+               names_to = "tipo", values_to = "tasa")
+
+# Boxplot comparativo
+ggplot(datos_long_6070, aes(x = tipo, y = tasa, fill = tipo)) +
+  geom_boxplot(width = 0.5, alpha = 0.8, outlier.shape = 16, outlier.size = 2) + 
+  labs(
+    title = "Tasa por 100.000 habitantes",
+    x = "",
+    y = ""
+  ) +
+  scale_fill_manual(values = c("tasa_cruda" = "red", "tasa_suavizada" = "blue")) +
+  theme_minimal(base_size = 14) +  
+  theme(
+    legend.position = "none",  # Quita la leyenda
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"), 
+    axis.title = element_text(size = 14, face = "bold"), 
+    axis.text = element_text(size = 12),  
+    panel.grid.major = element_line(color = "gray", size = 0.1),  
+    panel.grid.minor = element_line(color = "gray", size = 0.1),  
+    panel.border = element_rect(color = "gray", fill = NA, size = 0.5)
+  )
+```
+
+```{r warning=FALSE,message=FALSE}
+# Agregar a nivel provincia (media de todos los años)
+datos_agg_6070 <- datos60_70 %>%
+  group_by(Region, x, y) %>%
+  summarise(tasa_suavizada = mean(tasa_suavizada, na.rm = TRUE), .groups = "drop")
+
+# Crear SpatialPointsDataFrame para ajuste
+coordinates(datos_agg_6070) <- ~x + y
+proj4string(datos_agg_6070) <- CRS("+proj=utm +zone=30 +datum=WGS84")
+
+# Añadir variables de tendencia
+datos_agg_6070$tendencia_x <- datos_agg_6070@coords[,1]
+datos_agg_6070$tendencia_y <- datos_agg_6070@coords[,2]
+
+# Ajuste de modelo lineal (tendencia cuadrática)
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_6070@data)
+datos_agg_6070@data$residuos <- residuals(modelo_lm)
+
+# Ajustar variograma de los residuos
+vgm_emp <- variogram(residuos ~ 1, datos_agg_6070)
+vgm_ini <- vgm(psill = 50000, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_6070 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+plot(vgm_emp, vgm_fit_6070, main = "")
+
+
+# Kriging universal sobre los centroides
+datos_agg_6070$tendencia_x <- coordinates(datos_agg_6070)[,1]
+datos_agg_6070$tendencia_y <- coordinates(datos_agg_6070)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  newdata = datos_agg_6070,
+  model = vgm_fit_6070
+)
+
+# Convertir a data.frame y unir con mapa
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_6070@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Mapa final
+ggplot(carto_sf) +
+  geom_sf(aes(fill = var1.pred), color = "white") +
+  scale_fill_viridis_c(name = "Tasa estimada") +
+  labs(
+    title = "",
+    subtitle = "",
+    x = "X", y = "Y"
+  ) +
+  theme_minimal()
+```
+El boxplot muestra un mayor rango intercuartílico y una concentración de valores en la parte superior, lo que sugiere una mayor desigualdad en la distribución del riesgo espacial. Se observan varios valores atípicos por exceso.
+
+En términos espaciales, se refuerza un patrón norte-sur con provincias de la cornisa cantábrica —como Asturias, Vizcaya y Navarra— registrando las tasas suavizadas más altas. También destacan Salamanca y La Rioja como puntos elevados en el interior. El litoral mediterráneo y suroeste peninsular presentan valores más bajos, destacando Cádiz, Huelva, Valencia y Castellón. Este gradiente refleja un patrón espacial más definido, posiblemente vinculado a diferencias estructurales o ambientales entre zonas.
+
+### Grupo [70,80)
+ Para el tercer grupo de edad (70-80 años) se realiza el siguiente codigo:
+  
+```{r warning=FALSE,message=FALSE}
+# Filtrar datos válidos
+datos70_80 <- grupo_70_80 %>%
+  filter(!is.na(O), !is.na(Pop), Pop > 0)
+
+datos70_80 <- datos70_80 %>%
+  mutate(tasa_cruda = crude.rate)
+
+datos70_80 <- datos70_80 %>%
+  mutate(Region = ID)
+
+# Preparar centroides de provincias
+carto_esp <- Carto_Esp
+centroides <- coordinates(carto_esp)
+coord_df <- as.data.frame(centroides)
+colnames(coord_df) <- c("x", "y")
+coord_df$Region <- as.integer(as.character(carto_esp@data$ID))
+
+datos70_80 <- datos70_80 %>%
+  mutate(Region = as.integer(as.character(Region)))
+
+# Unir coordenadas
+datos70_80 <- left_join(datos70_80, coord_df, by = "Region")
+
+# Calcular media y varianza global
+media_global <- mean(datos70_80$tasa_cruda, na.rm = TRUE)
+var_global <- var(datos70_80$tasa_cruda, na.rm = TRUE)
+cat(" Media global:", round(media_global, 2), "\n")
+cat(" Varianza global:", round(var_global, 2), "\n")
+
+# Varianza local por región
+var_local <- datos70_80 %>%
+  group_by(Region) %>%
+  summarise(var_local = var(tasa_cruda, na.rm = TRUE), .groups = "drop")
+
+# Suavizado bayesiano empírico
+datos70_80 <- left_join(datos70_80, var_local, by = "Region") %>%
+  mutate(
+    coef_contraccion = var_global / (var_global + var_local),
+    tasa_suavizada = coef_contraccion * tasa_cruda + (1 - coef_contraccion) * media_global
+  )
+
+# Boxplot comparativo
+datos_long_7080 <- datos70_80 %>%
+  select(Region, tasa_cruda, tasa_suavizada) %>%
+  pivot_longer(cols = c(tasa_cruda, tasa_suavizada),
+               names_to = "tipo", values_to = "tasa")
+
+ggplot(datos_long_7080, aes(x = tipo, y = tasa, fill = tipo)) +
+  geom_boxplot(width = 0.5, alpha = 0.8, outlier.shape = 16, outlier.size = 2) + 
+  labs(
+    title = "Tasa por 100.000 habitantes",
+    x = "",
+    y = ""
+  ) +
+  scale_fill_manual(values = c("tasa_cruda" = "red", "tasa_suavizada" = "blue")) +
+  theme_minimal(base_size = 14) +  
+  theme(
+    legend.position = "none",  # Quita la leyenda
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"), 
+    axis.title = element_text(size = 14, face = "bold"), 
+    axis.text = element_text(size = 12),  
+    panel.grid.major = element_line(color = "gray", size = 0.1),  
+    panel.grid.minor = element_line(color = "gray", size = 0.1),  
+    panel.border = element_rect(color = "gray", fill = NA, size = 0.5)
+  )
+```
+
+```{r warning=FALSE,message=FALSE}
+# Agregar a nivel provincia (media de todos los años)
+datos_agg_7080 <- datos70_80 %>%
+  group_by(Region, x, y) %>%
+  summarise(tasa_suavizada = mean(tasa_suavizada, na.rm = TRUE), .groups = "drop")
+
+# Crear SpatialPointsDataFrame para ajuste
+coordinates(datos_agg_7080) <- ~x + y
+proj4string(datos_agg_7080) <- CRS("+proj=utm +zone=30 +datum=WGS84")
+
+# Añadir variables de tendencia
+datos_agg_7080$tendencia_x <- datos_agg_7080@coords[,1]
+datos_agg_7080$tendencia_y <- datos_agg_7080@coords[,2]
+
+# Ajuste de modelo lineal (tendencia cuadrática)
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_7080@data)
+datos_agg_7080@data$residuos <- residuals(modelo_lm)
+
+# Ajustar variograma de los residuos
+vgm_emp <- variogram(residuos ~ 1, datos_agg_7080)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget =0 )
+vgm_fit_7080 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+plot(vgm_emp, vgm_fit_7080, main = "")
+
+# Kriging universal sobre los centroides
+datos_agg_7080$tendencia_x <- coordinates(datos_agg_7080)[,1]
+datos_agg_7080$tendencia_y <- coordinates(datos_agg_7080)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_7080,
+  newdata = datos_agg_7080,
+  model = vgm_fit_7080
+)
+
+# Convertir a data.frame y unir con mapa
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_7080@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Mapa final
+ggplot(carto_sf) +
+  geom_sf(aes(fill = var1.pred), color = "white") +
+  scale_fill_viridis_c(name = "Tasa estimada") +
+  labs(
+    title = "",
+    subtitle = "",
+    x = "X", y = "Y"
+  ) +
+  theme_minimal()
+```
+
+
+El boxplot revela una mayor variabilidad, con un rango intercuartílico más amplio y mayor número de valores extremos. Esto indica una dispersión espacial más acusada del riesgo suavizado en este grupo.
+
+El mapa de kriging muestra una concentración clara del riesgo en el cuadrante noroeste, especialmente en Asturias, León, Palencia y Zamora. Además, se observan focos en el noreste, como Zaragoza y Lérida. El sur peninsular —incluyendo Sevilla, Granada y Almería— mantiene tasas más reducidas. Esta fase del ciclo vital parece coincidir con un máximo de contraste regional en la distribución espacial del riesgo, con focos de alta incidencia claramente delimitados.
+
+
+### Grupo [80,+)
+    Para el cuarto grupo de edad (+80años) se realiza el siguiente codigo:
+```{r warning=FALSE,message=FALSE}
+# Filtrar datos válidos
+datos80_ <- grupo_80_100 %>%
+  filter(!is.na(O), !is.na(Pop), Pop > 0)
+
+datos80_ <- datos80_ %>%
+  mutate(tasa_cruda = crude.rate)
+
+datos80_ <- datos80_ %>%
+  mutate(Region = ID)
+
+# Preparar centroides de provincias
+carto_esp <- Carto_Esp
+centroides <- coordinates(carto_esp)
+coord_df <- as.data.frame(centroides)
+colnames(coord_df) <- c("x", "y")
+coord_df$Region <- as.integer(as.character(carto_esp@data$ID))
+
+datos80_ <- datos80_ %>%
+  mutate(Region = as.integer(as.character(Region)))
+
+# Unir coordenadas
+datos80_ <- left_join(datos80_, coord_df, by = "Region")
+
+# Calcular media y varianza global
+media_global <- mean(datos80_$tasa_cruda, na.rm = TRUE)
+var_global <- var(datos80_$tasa_cruda, na.rm = TRUE)
+cat(" Media global:", round(media_global, 2), "\n")
+cat(" Varianza global:", round(var_global, 2), "\n")
+
+# Varianza local por región
+var_local <- datos80_ %>%
+  group_by(Region) %>%
+  summarise(var_local = var(tasa_cruda, na.rm = TRUE), .groups = "drop")
+
+# Suavizado bayesiano empírico
+datos80_ <- left_join(datos80_, var_local, by = "Region") %>%
+  mutate(
+    coef_contraccion = var_global / (var_global + var_local),
+    tasa_suavizada = coef_contraccion * tasa_cruda + (1 - coef_contraccion) * media_global
+  )
+
+# Boxplot comparativo
+datos_long_80 <- datos80_ %>%
+  select(Region, tasa_cruda, tasa_suavizada) %>%
+  pivot_longer(cols = c(tasa_cruda, tasa_suavizada),
+               names_to = "tipo", values_to = "tasa")
+
+ggplot(datos_long_80, aes(x = tipo, y = tasa, fill = tipo)) +
+  geom_boxplot(width = 0.5, alpha = 0.8, outlier.shape = 16, outlier.size = 2) + 
+  labs(
+    title = "Tasa por 100.000 habitantes",
+    x = "",
+    y = ""
+  ) +
+  scale_fill_manual(values = c("tasa_cruda" = "red", "tasa_suavizada" = "blue")) +
+  theme_minimal(base_size = 14) +  
+  theme(
+    legend.position = "none",  # Quita la leyenda
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"), 
+    axis.title = element_text(size = 14, face = "bold"), 
+    axis.text = element_text(size = 12),  
+    panel.grid.major = element_line(color = "gray", size = 0.1),  
+    panel.grid.minor = element_line(color = "gray", size = 0.1),  
+    panel.border = element_rect(color = "gray", fill = NA, size = 0.5)
+  )
+```
+
+```{r warning=FALSE,message=FALSE}
+# Agregar a nivel provincia (media de todos los años)
+datos_agg_80 <- datos80_ %>%
+  group_by(Region, x, y) %>%
+  summarise(tasa_suavizada = mean(tasa_suavizada, na.rm = TRUE), .groups = "drop")
+
+# Crear SpatialPointsDataFrame para ajuste
+coordinates(datos_agg_80) <- ~x + y
+proj4string(datos_agg_80) <- CRS("+proj=utm +zone=30 +datum=WGS84")
+
+# Añadir variables de tendencia
+datos_agg_80$tendencia_x <- datos_agg_80@coords[,1]
+datos_agg_80$tendencia_y <- datos_agg_80@coords[,2]
+
+# Ajuste de modelo lineal (tendencia cuadrática)
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_80@data)
+datos_agg_80@data$residuos <- residuals(modelo_lm)
+
+# Ajustar variograma de los residuos
+vgm_emp <- variogram(residuos ~ 1, datos_agg_80)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_80 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+plot(vgm_emp,vgm_fit_80, main = "")
+
+# Kriging universal sobre los centroides
+datos_agg_80$tendencia_x <- coordinates(datos_agg_80)[,1]
+datos_agg_80$tendencia_y <- coordinates(datos_agg_80)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_80,
+  newdata = datos_agg_80,
+  model = vgm_fit_80
+)
+
+# Convertir a data.frame y unir con mapa
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_80@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Mapa final
+ggplot(carto_sf) +
+  geom_sf(aes(fill = var1.pred), color = "white") +
+  scale_fill_viridis_c(name = "Tasa estimada") +
+  labs(
+    title = "",
+    subtitle = "",
+    x = "X", y = "Y"
+  ) +
+  theme_minimal()
+```
+
+El boxplot en este grupo muestra una menor dispersión y ausencia de valores extremos marcados, reflejando una homogeneidad creciente del riesgo estimado entre provincias.
+
+Espacialmente, el patrón se suaviza respecto a los grupos anteriores, con un riesgo más homogéneo en todo el territorio. No obstante, persisten ciertos valores superiores en Asturias, Vizcaya y Burgos. En el sur, las provincias de Ciudad Real, Jaén y Córdoba presentan los niveles más bajos. La disminución del contraste espacial sugiere un efecto de dilución de las diferencias regionales a edades más avanzadas, posiblemente vinculado a una menor selectividad estructural o a la influencia acumulada de factores biológicos y sociales que actúan de forma más homogénea sobre la población superviviente a edades extremas.
+
+
+### Validación cruzada 
+
+Realizamos la validación cruzada para cada grupo de edad. Para ello, creamos una función en la que calculará las medidas de los errores necesarios, y posteriormente se aplicará a cada conjunto de datos de validación cruzada de cada grupo de edad.
+ 
+```{r warning=FALSE,message=FALSE}
+summary_cv <- function(cv.data, na.rm = FALSE,
+                       tol = sqrt(.Machine$double.eps)) {
+  err <- cv.data$residual      
+  obs <- cv.data$observed
+  z <- cv.data$zscore
+  w <- 1 / pmax(cv.data$var1.var, tol)
+  if(na.rm) {
+    is.a <- !is.na(err)
+    err <- err[is.a]
+    obs <- obs[is.a]
+    z <- z[is.a]
+    w <- w[is.a]
+  }
+  perr <- 100 * err / pmax(obs, tol)  
+  return(c(
+    
+    me = mean(err),  # error medio         
+    rmse = sqrt(mean(err^2)), # raíz del error cuadrático medio
+    mae = mean(abs(err)),     # error absoluto medio
+    mpe = mean(perr),         
+    mape = mean(abs(perr)), 
+    r.squared = 1 - sum(err^2) / sum((obs - mean(obs))^2), # R^2
+    dme = mean(z),            
+    dmse = sqrt(mean(z^2)),   # error cuadrático medio adimensional
+    rwmse = sqrt(weighted.mean(err^2, w)) # raíz del ECM ponderado
+  ))
+}
+
+```
+ 
+ Realizamos la validación cruzada (LOOCV) para el grupo de 50-60 años y sus gráficos de los errores correspondientes.
+ 
+```{r warning=FALSE,message=FALSE}
+# Validación cruzada para el primer grupo de edad
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+# Resumen para el resultado de LOOCV
+summary_cv(cv_5060) 
+
+# Calcular los residuos (observado - predicción)
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+# Mapas de error por provincia
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  # Residuos de la validación cruzada
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326)
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+
+```
+En el gráfico Q-Q se puede observar que los residuos de la validación cruzada siguen una distribución aproximadamente normal.Podemos ver que los residuos se distribuyen de forma homogénea cerca de la linea del gráfico, por lo que se puede decir que el modelo Kriging está captando bien la los datos. Sin embargo, existen ciertos puntos que se alejan de forma más notable de la linea teórica, por lo que podrían tratarse de valoes atípicos y habría que mmirarlos. Además, obtenemos un R2 de 0.26 aproximadamente, lo que demuestra que el modelo solo es capaz de captar el 26% de la variabilidad de los datos. Procedemos a ver si existen valores atípicos, considerando atípicos que sobre pasan la media 2 desviaciones típicas.
+
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+
+Tras identificar los outliers, en este caso una observación, volvemos a relizar el proceso de Kriging sin la observación en nuestro dataset para ver si mejora o no la posterior evaluación del modelo. Se trata del mismo código que el proceso anterior pero en este caso eliminando la observación outlier. 
+
+```{r warning=FALSE,message=FALSE}
+# Sirve para poder acceder bien a las coordenadas y eliminarlas, ya que los decimales impiden a veces acceder a ellas
+tolerance <- 1e-5
+
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_5060 <- datos_agg_5060[!(
+  (abs(datos_agg_5060$x - (-2.167929)) < tolerance & abs(datos_agg_5060$y - 43.15281) < tolerance) |
+  (abs(datos_agg_5060$x - (-0.05960914)) < tolerance & abs(datos_agg_5060$y - 42.21424) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+summary_cv(cv_5060) 
+
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+El gráfico Q-Q sigue mostrando que los residuos se distribuyen de forma aproximadamente normal, aunque sigue habiendo ciertos residuos que se encuentran más alejados de la línea, lo que podría seguir habiendo valores outliers. En cuanto a las métricas de los errores, el error medio es prácticamente 0, el error absoluto es bajo ya que toma un valor de 0.1367. Además, ha habido un incremento de un 8% del R2, lo que sugiere que el modelo ha sido capaz de captar mejor la variabilidad de los datos. Volvemos a examinar si sigue habiendo outliers.
+
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+```{r warning=FALSE,message=FALSE}
+# Sirve para poder acceder bien a las coordenadas y eliminarlas, ya que los decimales impiden a veces acceder a ellas
+tolerance <- 1e-5
+
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_5060 <- datos_agg_5060[!(
+  (abs(datos_agg_5060$x - (-6.155351)) < tolerance & abs(datos_agg_5060$y - 39.72319) < tolerance) |
+  (abs(datos_agg_5060$x - (-7.439683)) < tolerance & abs(datos_agg_5060$y - 43.02348) < tolerance) 
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+summary_cv(cv_5060) 
+
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+```{r warning=FALSE,message=FALSE}
+# Sirve para poder acceder bien a las coordenadas y eliminarlas, ya que los decimales impiden a veces acceder a ellas
+tolerance <- 1e-5
+
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_5060 <- datos_agg_5060[!(
+  (abs(datos_agg_5060$x - (-5.982602)) < tolerance & abs(datos_agg_5060$y - 43.30684) < tolerance) |
+  (abs(datos_agg_5060$x - (-2.832237)) < tolerance & abs(datos_agg_5060$y - 43.25279) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+summary_cv(cv_5060) 
+
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+```{r warning=FALSE,message=FALSE}
+# Sirve para poder acceder bien a las coordenadas y eliminarlas, ya que los decimales impiden a veces acceder a ellas
+tolerance <- 1e-5
+
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_5060 <- datos_agg_5060[!(
+  (abs(datos_agg_5060$x - (-3.272516)) < tolerance & abs(datos_agg_5060$y - 37.33305) < tolerance) |
+  (abs(datos_agg_5060$x - (-6.832653)) < tolerance & abs(datos_agg_5060$y - 37.59783) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+summary_cv(cv_5060) 
+
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+```{r warning=FALSE,message=FALSE}
+# Sirve para poder acceder bien a las coordenadas y eliminarlas, ya que los decimales impiden a veces acceder a ellas
+tolerance <- 1e-5
+
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_5060 <- datos_agg_5060[!(
+  (abs(datos_agg_5060$x - (-8.459719)) < tolerance & abs(datos_agg_5060$y - 43.12804) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+summary_cv(cv_5060) 
+
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+```{r warning=FALSE,message=FALSE}
+# Sirve para poder acceder bien a las coordenadas y eliminarlas, ya que los decimales impiden a veces acceder a ellas
+tolerance <- 1e-5
+
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_5060 <- datos_agg_5060[!(
+  (abs(datos_agg_5060$x - (-3.71282)) < tolerance & abs(datos_agg_5060$y - 40.5071) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+summary_cv(cv_5060) 
+
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+```{r warning=FALSE,message=FALSE}
+# Sirve para poder acceder bien a las coordenadas y eliminarlas, ya que los decimales impiden a veces acceder a ellas
+tolerance <- 1e-5
+
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_5060 <- datos_agg_5060[!(
+  (abs(datos_agg_5060$x - (1.457916)) < tolerance & abs(datos_agg_5060$y - 36.43187) < tolerance)), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+summary_cv(cv_5060) 
+
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+```{r warning=FALSE,message=FALSE}
+# Sirve para poder acceder bien a las coordenadas y eliminarlas, ya que los decimales impiden a veces acceder a ellas
+tolerance <- 1e-5
+
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_5060 <- datos_agg_5060[!(
+  (abs(datos_agg_5060$x - (-2.501298)) < tolerance & abs(datos_agg_5060$y - 42.28346) < tolerance) |
+  (abs(datos_agg_5060$x - (-5.688757)) < tolerance & abs(datos_agg_5060$y - 37.44888) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+summary_cv(cv_5060) 
+
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+```{r warning=FALSE,message=FALSE}
+# Sirve para poder acceder bien a las coordenadas y eliminarlas, ya que los decimales impiden a veces acceder a ellas
+tolerance <- 1e-5
+
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_5060 <- datos_agg_5060[!(
+  (abs(datos_agg_5060$x - (-0.1480393) < tolerance & abs(datos_agg_5060$y - 40.25073) < tolerance)
+)), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+summary_cv(cv_5060) 
+
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+```{r warning=FALSE,message=FALSE}
+# Sirve para poder acceder bien a las coordenadas y eliminarlas, ya que los decimales impiden a veces acceder a ellas
+tolerance <- 1e-5
+
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_5060 <- datos_agg_5060[!(
+  (abs(datos_agg_5060$x - (-2.699203)) < tolerance & abs(datos_agg_5060$y - 42.83627) < tolerance) |
+  (abs(datos_agg_5060$x - (-3.591347)) < tolerance & abs(datos_agg_5060$y - 42.37297) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_5060@data)
+datos_agg_5060@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_5060)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_5060 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_5060$tendencia_x <- coordinates(datos_agg_5060)[,1]
+datos_agg_5060$tendencia_y <- coordinates(datos_agg_5060)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  newdata = datos_agg_5060,
+  model = vgm_fit_5060
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_5060@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_5060 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_5060,
+  model = vgm_fit_5060) 
+
+summary_cv(cv_5060) 
+
+cv_5060$residual <- cv_5060$observed - cv_5060$var1.pred
+
+qqnorm(cv_5060$residual, main = "Gráfico de Probabilidad Normal de los Residuos de Validación Cruzada")
+qqline(cv_5060$residual, col = "blue")
+
+coords <- coordinates(cv_5060)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_5060$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+
+ggplot() +
+  geom_sf(data = carto_sf, fill = "white", color = "black") +
+  geom_sf(data = residuals_sf, aes(fill = residual)) +  
+  scale_fill_gradient2(midpoint = 0, low = "white", high = "black", mid = "gray") +
+  geom_text(data = residuals_sf, aes(x = x, y = y, label = round(residual, 2)), 
+            size = 3, color = "black", hjust = -0.2, vjust = 0.5) +
+  labs(
+    title = "",
+    x = "",
+    y = "",
+    fill = "Error"
+  ) +
+  theme_minimal() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12)
+  )
+```
+```{r warning=FALSE,message=FALSE}
+# Media y desviación de los residuos
+media_residual <- mean(cv_5060$residual)
+sd_residual <- sd(cv_5060$residual)
+
+# Umbrales
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar cuales son las observaciones outliers
+outliers <- cv_5060[cv_5060$residual > outlier_sup | cv_5060$residual < outlier_inf, ]
+outliers
+```
+
+No aparecen nuevos outliers, por lo que consideramos que la validación cruzada ha finalizado.
+
+Seguimos con el grupo de 60-70 años:
+ 
+```{r warning=FALSE,message=FALSE}
+cv_6070 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  model = vgm_fit_6070) # Validación cruzada para el primer grupo de edad
+
+# Resumen para el resultado de LOOCV
+summary_cv(cv_6070) 
+
+# Calcular los residuos (observado - predicción)
+cv_6070$residual <- cv_6070$observed - cv_6070$var1.pred
+
+coords <- coordinates(cv_6070)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_6070$residual  # Residuos de la validación cruzada
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326)  # Usando WGS84
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_6070$residual)
+sd_residual <- sd(cv_6070$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar las observaciones que están fuera de estos umbrales
+outliers <- cv_6070[cv_6070$residual > outlier_sup | cv_6070$residual < outlier_inf, ]
+outliers
+```
+ 
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_6070 <- datos_agg_6070[!(
+  (abs(datos_agg_6070$x - (2.919466)) < tolerance & abs(datos_agg_6070$y - 39.63202) < tolerance) |
+  (abs(datos_agg_6070$x - (-2.167929)) < tolerance & abs(datos_agg_6070$y - 43.15281) < tolerance)|
+    (abs(datos_agg_6070$x - (-0.5769094)) < tolerance & abs(datos_agg_6070$y - 38.49749) < tolerance) |
+  (abs(datos_agg_6070$x - (-4.048524)) < tolerance & abs(datos_agg_6070$y - 41.1828) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_6070@data)
+datos_agg_6070@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_6070)
+vgm_ini <- vgm(psill = 50000, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_6070 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_6070$tendencia_x <- coordinates(datos_agg_6070)[,1]
+datos_agg_6070$tendencia_y <- coordinates(datos_agg_6070)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  newdata = datos_agg_6070,
+  model = vgm_fit_6070
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_6070@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_6070 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  model = vgm_fit_6070) 
+
+summary_cv(cv_6070) 
+
+cv_6070$residual <- cv_6070$observed - cv_6070$var1.pred
+
+coords <- coordinates(cv_6070)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_6070$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_6070$residual)
+sd_residual <- sd(cv_6070$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+outliers <- cv_6070[cv_6070$residual > outlier_sup | cv_6070$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_6070 <- datos_agg_6070[!(
+  (abs(datos_agg_6070$x - (-4.524478)) < tolerance & abs(datos_agg_6070$y - 42.38586) < tolerance) |
+  (abs(datos_agg_6070$x - (-3.449798)) < tolerance & abs(datos_agg_6070$y - 38.03083) < tolerance) |
+  (abs(datos_agg_6070$x - (-5.982602)) < tolerance & abs(datos_agg_6070$y - 43.30684) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_6070@data)
+datos_agg_6070@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_6070)
+vgm_ini <- vgm(psill = 50000, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_6070 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_6070$tendencia_x <- coordinates(datos_agg_6070)[,1]
+datos_agg_6070$tendencia_y <- coordinates(datos_agg_6070)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  newdata = datos_agg_6070,
+  model = vgm_fit_6070
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_6070@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_6070 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  model = vgm_fit_6070) 
+
+summary_cv(cv_6070) 
+
+cv_6070$residual <- cv_6070$observed - cv_6070$var1.pred
+
+coords <- coordinates(cv_6070)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_6070$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_6070$residual)
+sd_residual <- sd(cv_6070$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+outliers <- cv_6070[cv_6070$residual > outlier_sup | cv_6070$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_6070 <- datos_agg_6070[!(
+  (abs(datos_agg_6070$x - (-2.195487)) < tolerance & abs(datos_agg_6070$y - 39.90869) < tolerance) |
+  (abs(datos_agg_6070$x - (-7.577512)) < tolerance & abs(datos_agg_6070$y - 42.20588) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_6070@data)
+datos_agg_6070@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_6070)
+vgm_ini <- vgm(psill = 50000, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_6070 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_6070$tendencia_x <- coordinates(datos_agg_6070)[,1]
+datos_agg_6070$tendencia_y <- coordinates(datos_agg_6070)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  newdata = datos_agg_6070,
+  model = vgm_fit_6070
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_6070@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_6070 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  model = vgm_fit_6070) 
+
+summary_cv(cv_6070) 
+
+cv_6070$residual <- cv_6070$observed - cv_6070$var1.pred
+
+coords <- coordinates(cv_6070)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_6070$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_6070$residual)
+sd_residual <- sd(cv_6070$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+outliers <- cv_6070[cv_6070$residual > outlier_sup | cv_6070$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_6070 <- datos_agg_6070[!(
+  (abs(datos_agg_6070$x - (-6.155351)) < tolerance & abs(datos_agg_6070$y - 39.72319) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_6070@data)
+datos_agg_6070@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_6070)
+vgm_ini <- vgm(psill = 50000, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_6070 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_6070$tendencia_x <- coordinates(datos_agg_6070)[,1]
+datos_agg_6070$tendencia_y <- coordinates(datos_agg_6070)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  newdata = datos_agg_6070,
+  model = vgm_fit_6070
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_6070@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_6070 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  model = vgm_fit_6070) 
+
+summary_cv(cv_6070) 
+
+cv_6070$residual <- cv_6070$observed - cv_6070$var1.pred
+
+coords <- coordinates(cv_6070)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_6070$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_6070$residual)
+sd_residual <- sd(cv_6070$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+outliers <- cv_6070[cv_6070$residual > outlier_sup | cv_6070$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+datos_agg_6070 <- datos_agg_6070[!(
+  (abs(datos_agg_6070$x - (-0.789649)) < tolerance & abs(datos_agg_6070$y - 39.35792) < tolerance) 
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_6070@data)
+datos_agg_6070@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_6070)
+vgm_ini <- vgm(psill = 50000, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_6070 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_6070$tendencia_x <- coordinates(datos_agg_6070)[,1]
+datos_agg_6070$tendencia_y <- coordinates(datos_agg_6070)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  newdata = datos_agg_6070,
+  model = vgm_fit_6070
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_6070@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_6070 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_6070,
+  model = vgm_fit_6070) 
+
+summary_cv(cv_6070) 
+
+cv_6070$residual <- cv_6070$observed - cv_6070$var1.pred
+
+qqnorm(cv_6070$residual, main = "Gráfico de Probabilidad Normal de los Residuos de CV")
+qqline(cv_6070$residual, col = "blue")
+
+coords <- coordinates(cv_6070)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_6070$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+
+ggplot() +
+  geom_sf(data = carto_sf, fill = "white", color = "black") +
+  geom_sf(data = residuals_sf, aes(fill = residual)) +  
+  scale_fill_gradient2(midpoint = 0, low = "white", high = "black", mid = "gray") +
+  geom_text(data = residuals_sf, aes(x = x, y = y, label = round(residual, 2)), 
+            size = 3, color = "black", hjust = -0.2, vjust = 0.5) +
+  labs(
+    title = "",
+    x = "",
+    y = "",
+    fill = "Error"
+  ) +
+  theme_minimal() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12)
+  )
+```
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_6070$residual)
+sd_residual <- sd(cv_6070$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+outliers <- cv_6070[cv_6070$residual > outlier_sup | cv_6070$residual < outlier_inf, ]
+outliers
+```
+
+No existen más valores outliers. En este caso, las métricas que se obtienen son peores ya que obtenemos unos valores de los residuos un poco más altos que en el grupo de edad anterior y el caso del R2 se queda con un valor de 11%.
+
+Seguimos con el grupo de 70-80 años:
+
+```{r warning=FALSE,message=FALSE}
+cv_7080 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_7080,
+  model = vgm_fit_7080) # Validación cruzada para el primer grupo de edad
+
+# Resumen para el resultado de LOOCV
+summary_cv(cv_7080) 
+
+# Calcular los residuos (observado - predicción)
+cv_7080$residual <- cv_7080$observed - cv_7080$var1.pred
+
+coords <- coordinates(cv_7080)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_7080$residual  # Residuos de la validación cruzada
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326)  # Usando WGS84
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_7080$residual)
+sd_residual <- sd(cv_7080$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar las observaciones que están fuera de estos umbrales
+outliers <- cv_7080[cv_7080$residual > outlier_sup | cv_7080$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_7080 <- datos_agg_7080[!(
+  (abs(datos_agg_7080$x - (-8.459719)) < tolerance & abs(datos_agg_7080$y - 43.12804) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_7080@data)
+datos_agg_7080@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_7080)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_7080 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_7080$tendencia_x <- coordinates(datos_agg_7080)[,1]
+datos_agg_7080$tendencia_y <- coordinates(datos_agg_7080)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_7080,
+  newdata = datos_agg_7080,
+  model = vgm_fit_7080
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_7080@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_7080 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_7080,
+  model = vgm_fit_7080) 
+
+summary_cv(cv_7080) 
+
+cv_7080$residual <- cv_7080$observed - cv_7080$var1.pred
+
+coords <- coordinates(cv_7080)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_7080$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_7080$residual)
+sd_residual <- sd(cv_7080$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar las observaciones que están fuera de estos umbrales
+outliers <- cv_7080[cv_7080$residual > outlier_sup | cv_7080$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_7080 <- datos_agg_7080[!(
+  (abs(datos_agg_7080$x - (-2.167929)) < tolerance & abs(datos_agg_7080$y - 43.15281) < tolerance) |
+  (abs(datos_agg_7080$x - (1.457916)) < tolerance & abs(datos_agg_7080$y - 36.43187) < tolerance) 
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_7080@data)
+datos_agg_7080@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_7080)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_7080 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_7080$tendencia_x <- coordinates(datos_agg_7080)[,1]
+datos_agg_7080$tendencia_y <- coordinates(datos_agg_7080)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_7080,
+  newdata = datos_agg_7080,
+  model = vgm_fit_7080
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_7080@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_7080 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_7080,
+  model = vgm_fit_7080) 
+
+summary_cv(cv_7080) 
+
+cv_7080$residual <- cv_7080$observed - cv_7080$var1.pred
+
+coords <- coordinates(cv_7080)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_7080$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_7080$residual)
+sd_residual <- sd(cv_7080$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar las observaciones que están fuera de estos umbrales
+outliers <- cv_7080[cv_7080$residual > outlier_sup | cv_7080$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_7080 <- datos_agg_7080[!(
+  (abs(datos_agg_7080$x - (-5.688757)) < tolerance & abs(datos_agg_7080$y - 37.44888) < tolerance) |
+  (abs(datos_agg_7080$x - (-8.444609)) < tolerance & abs(datos_agg_7080$y - 42.4398) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_7080@data)
+datos_agg_7080@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_7080)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_7080 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_7080$tendencia_x <- coordinates(datos_agg_7080)[,1]
+datos_agg_7080$tendencia_y <- coordinates(datos_agg_7080)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_7080,
+  newdata = datos_agg_7080,
+  model = vgm_fit_7080
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_7080@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_7080 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_7080,
+  model = vgm_fit_7080) 
+
+summary_cv(cv_7080) 
+
+cv_7080$residual <- cv_7080$observed - cv_7080$var1.pred
+
+coords <- coordinates(cv_7080)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_7080$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_7080$residual)
+sd_residual <- sd(cv_7080$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar las observaciones que están fuera de estos umbrales
+outliers <- cv_7080[cv_7080$residual > outlier_sup | cv_7080$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_7080 <- datos_agg_7080[!(
+  (abs(datos_agg_7080$x - (-5.764685)) < tolerance & abs(datos_agg_7080$y - 36.5625) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_7080@data)
+datos_agg_7080@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_7080)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_7080 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_7080$tendencia_x <- coordinates(datos_agg_7080)[,1]
+datos_agg_7080$tendencia_y <- coordinates(datos_agg_7080)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_7080,
+  newdata = datos_agg_7080,
+  model = vgm_fit_7080
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_7080@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_7080 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_7080,
+  model = vgm_fit_7080) 
+
+summary_cv(cv_7080) 
+
+cv_7080$residual <- cv_7080$observed - cv_7080$var1.pred
+
+qqnorm(cv_7080$residual, main = "Gráfico de Probabilidad Normal de los Residuos de CV")
+qqline(cv_7080$residual, col = "blue")
+
+coords <- coordinates(cv_7080)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_7080$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+
+ggplot() +
+  geom_sf(data = carto_sf, fill = "white", color = "black") +
+  geom_sf(data = residuals_sf, aes(fill = residual)) +  
+  scale_fill_gradient2(midpoint = 0, low = "white", high = "black", mid = "gray") +
+  geom_text(data = residuals_sf, aes(x = x, y = y, label = round(residual, 2)), 
+            size = 3, color = "black", hjust = -0.2, vjust = 0.5) +
+  labs(
+    title = "",
+    x = "",
+    y = "",
+    fill = "Error"
+  ) +
+  theme_minimal() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12)
+  )
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_7080$residual)
+sd_residual <- sd(cv_7080$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar las observaciones que están fuera de estos umbrales
+outliers <- cv_7080[cv_7080$residual > outlier_sup | cv_7080$residual < outlier_inf, ]
+outliers
+```
+
+Por último, procedemos a hacer la validación cruzada del grupo de edad de más de 80 años:
+
+```{r warning=FALSE,message=FALSE}
+cv_80 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_80,
+  model = vgm_fit_80) # Validación cruzada para el primer grupo de edad
+
+# Resumen para el resultado de LOOCV
+summary_cv(cv_80) 
+
+# Calcular los residuos (observado - predicción)
+cv_80$residual <- cv_80$observed - cv_80$var1.pred
+
+coords <- coordinates(cv_80)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_80$residual  # Residuos de la validación cruzada
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326)  # Usando WGS84
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_80$residual)
+sd_residual <- sd(cv_80$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar las observaciones que están fuera de estos umbrales
+outliers <- cv_80[cv_80$residual > outlier_sup | cv_80$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_80 <- datos_agg_80[!(
+  (abs(datos_agg_80$x - (-5.982602)) < tolerance & abs(datos_agg_80$y - 43.30684) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_80@data)
+datos_agg_80@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_80)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_80 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_80$tendencia_x <- coordinates(datos_agg_80)[,1]
+datos_agg_80$tendencia_y <- coordinates(datos_agg_80)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_80,
+  newdata = datos_agg_80,
+  model = vgm_fit_80
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_80@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_80 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_80,
+  model = vgm_fit_80) 
+
+summary_cv(cv_80) 
+
+cv_80$residual <- cv_80$observed - cv_80$var1.pred
+
+coords <- coordinates(cv_80)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_80$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_80$residual)
+sd_residual <- sd(cv_80$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar las observaciones que están fuera de estos umbrales
+outliers <- cv_80[cv_80$residual > outlier_sup | cv_80$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_80 <- datos_agg_80[!(
+  (abs(datos_agg_80$x - (-2.356041)) < tolerance & abs(datos_agg_80$y - 37.21334) < tolerance) |
+  (abs(datos_agg_80$x - (1.457916)) < tolerance & abs(datos_agg_80$y - 36.43187) < tolerance) |
+  (abs(datos_agg_80$x - (-0.05960914)) < tolerance & abs(datos_agg_80$y - 42.21424) < tolerance) 
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_80@data)
+datos_agg_80@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_80)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_80 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_80$tendencia_x <- coordinates(datos_agg_80)[,1]
+datos_agg_80$tendencia_y <- coordinates(datos_agg_80)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_80,
+  newdata = datos_agg_80,
+  model = vgm_fit_80
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_80@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_80 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_80,
+  model = vgm_fit_80) 
+
+summary_cv(cv_80) 
+
+cv_80$residual <- cv_80$observed - cv_80$var1.pred
+
+coords <- coordinates(cv_80)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_80$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_80$residual)
+sd_residual <- sd(cv_80$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar las observaciones que están fuera de estos umbrales
+outliers <- cv_80[cv_80$residual > outlier_sup | cv_80$residual < outlier_inf, ]
+outliers
+```
+
+```{r warning=FALSE,message=FALSE}
+# Eliminar las observaciones cercanas a las coordenadas específicas
+datos_agg_80 <- datos_agg_80[!(
+  (abs(datos_agg_80$x - (-3.591347)) < tolerance & abs(datos_agg_80$y - 42.37297) < tolerance) |
+  (abs(datos_agg_80$x - (-2.167929)) < tolerance & abs(datos_agg_80$y - 43.15281) < tolerance) |
+  (abs(datos_agg_80$x - (-7.577512)) < tolerance & abs(datos_agg_80$y - 42.20588) < tolerance)
+), ]
+
+modelo_lm <- lm(tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2), data = datos_agg_80@data)
+datos_agg_80@data$residuos <- residuals(modelo_lm)
+
+vgm_emp <- variogram(residuos ~ 1, datos_agg_80)
+vgm_ini <- vgm(psill = 50, model = "Exp", range = 150000, nugget = 0)
+vgm_fit_80 <- fit.variogram(vgm_emp, model = vgm_ini, fit.method = 1)
+
+# Kriging universal sobre los centroides con la observación eliminada
+datos_agg_80$tendencia_x <- coordinates(datos_agg_80)[,1]
+datos_agg_80$tendencia_y <- coordinates(datos_agg_80)[,2]
+
+kriging_result <- krige(
+  formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_80,
+  newdata = datos_agg_80,
+  model = vgm_fit_80
+)
+
+krig_df <- as.data.frame(kriging_result)
+krig_df$Region <- datos_agg_80@data$Region
+
+carto_sf <- st_as_sf(Carto_Esp)
+carto_sf$Region <- as.integer(as.character(carto_sf$ID))
+carto_sf <- left_join(carto_sf, krig_df[, c("Region", "var1.pred")], by = "Region")
+
+# Nueva validación cruzada con la observación eliminada
+cv_80 <- krige.cv(formula = tasa_suavizada ~ tendencia_x + tendencia_y + I(tendencia_x^2) + I(tendencia_y^2),
+  locations = datos_agg_80,
+  model = vgm_fit_80) 
+
+summary_cv(cv_80) 
+
+cv_80$residual <- cv_80$observed - cv_80$var1.pred
+
+qqnorm(cv_80$residual, main = "Gráfico de Probabilidad Normal de los Residuos de CV")
+qqline(cv_80$residual, col = "blue")
+
+coords <- coordinates(cv_80)
+residuals_df <- data.frame(
+  x = coords[, 1],  
+  y = coords[, 2],  
+  residual = cv_80$residual  
+)
+residuals_sf <- st_as_sf(residuals_df, coords = c("x", "y"), crs = 4326) 
+residuals_sf <- st_transform(residuals_sf, st_crs(carto_sf))
+
+coords_residuals <- st_coordinates(residuals_sf)
+
+residuals_sf$x <- coords_residuals[, 1]
+residuals_sf$y <- coords_residuals[, 2]
+
+ggplot() +
+  geom_sf(data = carto_sf, fill = "white", color = "black") +
+  geom_sf(data = residuals_sf, aes(fill = residual)) +  
+  scale_fill_gradient2(midpoint = 0, low = "white", high = "black", mid = "gray") +
+  geom_text(data = residuals_sf, aes(x = x, y = y, label = round(residual, 2)), 
+            size = 3, color = "black", hjust = -0.2, vjust = 0.5) +
+  labs(
+    title = "",
+    x = "",
+    y = "",
+    fill = "Error"
+  ) +
+  theme_minimal() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 12)
+  )
+```
+
+```{r warning=FALSE,message=FALSE}
+media_residual <- mean(cv_80$residual)
+sd_residual <- sd(cv_80$residual)
+
+outlier_sup <- media_residual + 2 * sd_residual
+outlier_inf <- media_residual - 2 * sd_residual
+
+# Identificar las observaciones que están fuera de estos umbrales
+outliers <- cv_80[cv_80$residual > outlier_sup | cv_80$residual < outlier_inf, ]
+outliers
+```
